@@ -1,5 +1,6 @@
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta
+import logging
 import os
 import time
 from typing import Annotated
@@ -23,11 +24,17 @@ client = AsyncOpenAI(
 TEST_USERNAME = "test"
 TEST_PASSWORD = "test"
 JWT_SECRET = os.getenv("JWT_SECRET")
+JWT_EXPIRATION_HOURS = 24  # Token expires after 24 hours
+
+logger = logging.getLogger(__name__)
 
 # rate limit store is mapping from user email to list of timestamps of requests
 rate_limit_store: dict[str, list[float]] = {}
 # connections store is mapping from user email to number of connections
 connections_store: dict[str, int] = {}
+# locks to protect shared data structures from race conditions
+rate_limit_lock = asyncio.Lock()
+connections_lock = asyncio.Lock()
 RATE_LIMIT_WINDOW = 60 # 1 minute
 RATE_LIMIT_MAX_REQUESTS = 3
 MAX_CONNECTIONS_PER_USER = 2
@@ -51,7 +58,7 @@ async def add_process_time_header(request: Request, call_next):
     start_time = time.time()
     response = await call_next(request)
     process_time = time.time() - start_time
-    print("process_time", process_time)
+    logger.info(f"process_time: {process_time}")
     response.headers["X-Process-Time"] = str(process_time)
     return response
 
@@ -65,20 +72,27 @@ async def login(request: LoginRequest):
             detail="Invalid credentials",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    # now return a jwt bearer token
-    # encode the jwt token
+    # now return a jwt bearer token with expiration
+    expiration = datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS)
     token = jwt.encode(
         {
             "email": request.email,
+            "exp": expiration,
         },
         JWT_SECRET,
         algorithm="HS256",
     )
-    return {"token": token}
+    return {"token": token, "expires_at": expiration.isoformat()}
 
 async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]):
     try:
         return jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has expired",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     except jwt.InvalidTokenError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -89,33 +103,54 @@ async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]):
 async def check_rate_limit(current_user: Annotated[dict, Depends(get_current_user)]):
     user_email = current_user["email"]
     current_time = time.time()
-    if user_email not in rate_limit_store:
-        rate_limit_store[user_email] = []
-    rate_limit_store[user_email] = [timestamp for timestamp in rate_limit_store[user_email] if current_time - timestamp < RATE_LIMIT_WINDOW]
-    if len(rate_limit_store[user_email]) >= RATE_LIMIT_MAX_REQUESTS:
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded. Maximum 3 requests per minute.")
-    rate_limit_store[user_email].append(current_time)
+    
+    async with rate_limit_lock:
+        if user_email not in rate_limit_store:
+            rate_limit_store[user_email] = []
+        
+        # Filter old timestamps
+        rate_limit_store[user_email] = [
+            timestamp for timestamp in rate_limit_store[user_email] 
+            if current_time - timestamp < RATE_LIMIT_WINDOW
+        ]
+        
+        # Check limit
+        if len(rate_limit_store[user_email]) >= RATE_LIMIT_MAX_REQUESTS:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS, 
+                detail="Rate limit exceeded. Maximum 3 requests per minute."
+            )
+        
+        # Append new timestamp
+        rate_limit_store[user_email].append(current_time)
+    
     return current_user
 
-async def increment_connection(user_email: str):
-    if user_email not in connections_store:
-        connections_store[user_email] = 0
-    connections_store[user_email] += 1
-
 async def decrement_connection(user_email: str):
-    if user_email in connections_store:
-        connections_store[user_email] -= 1
-        if connections_store[user_email] <= 0:
-            del connections_store[user_email]
+    async with connections_lock:
+        if user_email in connections_store:
+            connections_store[user_email] -= 1
+            if connections_store[user_email] <= 0:
+                del connections_store[user_email]
 
 async def check_connection_limit(current_user: Annotated[dict, Depends(get_current_user)]):
     user_email = current_user["email"]
-    if user_email not in connections_store:
-        connections_store[user_email] = 0
-    if connections_store[user_email] >= MAX_CONNECTIONS_PER_USER:
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=f"Connection limit exceeded. Maximum {MAX_CONNECTIONS_PER_USER} connections per user.")
+    
+    async with connections_lock:
+        if user_email not in connections_store:
+            connections_store[user_email] = 0
+        
+        if connections_store[user_email] >= MAX_CONNECTIONS_PER_USER:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS, 
+                detail=f"Connection limit exceeded. Maximum {MAX_CONNECTIONS_PER_USER} connections per user."
+            )
+        
+        # Increment immediately while we hold the lock
+        connections_store[user_email] += 1
+    
     return current_user
-            
+
 async def stream_generator(prompt: str, request: Request, user_email: str):
     try:
         stream = await client.chat.completions.create(
@@ -138,8 +173,10 @@ async def completion(
     current_user: Annotated[dict, Depends(check_connection_limit)],
 ):
     user_email = current_user["email"]
-    await increment_connection(user_email)
-    return StreamingResponse(stream_generator(request_body.prompt, request, user_email), media_type="text/event-stream")
+    return StreamingResponse(
+        stream_generator(request_body.prompt, request, user_email), 
+        media_type="text/event-stream"
+    )
 
 
 # implementing a background task that will run every 10 minutes
@@ -149,12 +186,20 @@ async def startup_event():
 
 async def background_task():
     while True:
-        users_to_delete = []
-        current_time = time.time()
-        for user_email, timestamps in rate_limit_store.items():
-            rate_limit_store[user_email] = [timestamp for timestamp in timestamps if current_time - timestamp < RATE_LIMIT_WINDOW]
-            if len(rate_limit_store[user_email]) == 0:
-                users_to_delete.append(user_email)
-        for user_email in users_to_delete:
-            del rate_limit_store[user_email]
+        async with rate_limit_lock:
+            users_to_delete = []
+            current_time = time.time()
+            
+            # Use list() to avoid "dictionary changed size during iteration" errors
+            for user_email, timestamps in list(rate_limit_store.items()):
+                rate_limit_store[user_email] = [
+                    timestamp for timestamp in timestamps 
+                    if current_time - timestamp < RATE_LIMIT_WINDOW
+                ]
+                if len(rate_limit_store[user_email]) == 0:
+                    users_to_delete.append(user_email)
+            
+            for user_email in users_to_delete:
+                del rate_limit_store[user_email]
+        
         await asyncio.sleep(10 * 60)
