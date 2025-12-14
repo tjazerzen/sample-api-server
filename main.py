@@ -40,6 +40,87 @@ MAX_CONNECTIONS_PER_USER = 2
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
+class MetricsStore:
+    def __init__(self):
+        self.total_requests = 0
+        self.endpoint_requests = {}  # {endpoint: count}
+        self.endpoint_errors = {}    # {endpoint: {error_type: count}}
+        self.total_tokens_processed = 0
+        self.request_latencies = []  # Store recent latencies (keep last 1000)
+        self.max_latency_samples = 1000
+        self.lock = asyncio.Lock()
+    
+    async def increment_request(self, endpoint: str):
+        async with self.lock:
+            self.total_requests += 1
+            self.endpoint_requests[endpoint] = self.endpoint_requests.get(endpoint, 0) + 1
+    
+    async def increment_error(self, endpoint: str, error_type: str):
+        async with self.lock:
+            if endpoint not in self.endpoint_errors:
+                self.endpoint_errors[endpoint] = {}
+            self.endpoint_errors[endpoint][error_type] = \
+                self.endpoint_errors[endpoint].get(error_type, 0) + 1
+    
+    async def add_tokens(self, count: int):
+        async with self.lock:
+            self.total_tokens_processed += count
+    
+    async def record_latency(self, endpoint: str, latency_seconds: float):
+        async with self.lock:
+            self.request_latencies.append({
+                "endpoint": endpoint,
+                "latency": latency_seconds,
+                "timestamp": time.time()
+            })
+            # Keep only recent samples
+            if len(self.request_latencies) > self.max_latency_samples:
+                self.request_latencies = self.request_latencies[-self.max_latency_samples:]
+    
+    async def get_active_streams(self) -> int:
+        """Get current number of active streams from connections_store"""
+        async with connections_lock:
+            return sum(connections_store.values())
+    
+    async def get_metrics_summary(self):
+        async with self.lock:
+            # Calculate latency statistics
+            latency_stats = {}
+            if self.request_latencies:
+                latencies = [r["latency"] for r in self.request_latencies]
+                latency_stats = {
+                    "avg": sum(latencies) / len(latencies),
+                    "min": min(latencies),
+                    "max": max(latencies),
+                    "count": len(latencies)
+                }
+            
+            # Calculate per-endpoint latency averages
+            endpoint_latencies = {}
+            for record in self.request_latencies:
+                ep = record["endpoint"]
+                if ep not in endpoint_latencies:
+                    endpoint_latencies[ep] = []
+                endpoint_latencies[ep].append(record["latency"])
+            
+            endpoint_latency_avg = {
+                ep: sum(lats) / len(lats) 
+                for ep, lats in endpoint_latencies.items()
+            }
+            
+            return {
+                "total_requests": self.total_requests,
+                "endpoint_requests": self.endpoint_requests,
+                "endpoint_errors": self.endpoint_errors,
+                "total_tokens_processed": self.total_tokens_processed,
+                "active_streams": await self.get_active_streams(),
+                "latency_stats": latency_stats,
+                "endpoint_latency_avg": endpoint_latency_avg
+            }
+
+# Initialize metrics store
+metrics = MetricsStore()
+
 class CompletionRequest(BaseModel):
     prompt: str
 
@@ -54,11 +135,31 @@ def check_health():
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
     start_time = time.time()
-    response = await call_next(request)
-    process_time = time.time() - start_time
-    logger.info(f"process_time: {process_time}")
-    response.headers["X-Process-Time"] = str(process_time)
-    return response
+    
+    # Get the endpoint path
+    endpoint = request.url.path
+    
+    try:
+        response = await call_next(request)
+        process_time = time.time() - start_time
+        
+        # Record metrics
+        await metrics.increment_request(endpoint)
+        await metrics.record_latency(endpoint, process_time)
+        
+        logger.info(f"process_time: {process_time}")
+        response.headers["X-Process-Time"] = str(process_time)
+        return response
+    except Exception as e:
+        process_time = time.time() - start_time
+        
+        # Record error metrics
+        error_type = type(e).__name__
+        await metrics.increment_error(endpoint, error_type)
+        await metrics.record_latency(endpoint, process_time)
+        
+        # Re-raise the exception to let FastAPI handle it
+        raise
 
 
 # login to support bearer authentication
@@ -150,6 +251,7 @@ async def check_connection_limit(current_user: Annotated[dict, Depends(get_curre
     return current_user
 
 async def stream_generator(prompt: str, request: Request, user_email: str):
+    total_chars = 0  # Simple approximation: 1 token ≈ 4 chars
     try:
         stream = await client.chat.completions.create(
             model="gpt-4o",
@@ -160,8 +262,13 @@ async def stream_generator(prompt: str, request: Request, user_email: str):
             if await request.is_disconnected():
                 break
             if event.choices[0].delta.content:
-                yield event.choices[0].delta.content
+                content = event.choices[0].delta.content
+                total_chars += len(content)
+                yield content
     finally:
+        # Approximate token count (rough: 4 chars per token)
+        estimated_tokens = total_chars // 4
+        await metrics.add_tokens(estimated_tokens)
         await decrement_connection(user_email)
 
 @app.post("/completion")
@@ -175,6 +282,32 @@ async def completion(
         stream_generator(request_body.prompt, request, user_email), 
         media_type="text/event-stream"
     )
+
+@app.get("/metrics")
+async def get_metrics():
+    """Expose current metrics"""
+    return await metrics.get_metrics_summary()
+
+@app.get("/metrics/dashboard")
+async def metrics_dashboard():
+    """Human-readable metrics dashboard"""
+    summary = await metrics.get_metrics_summary()
+    
+    # Format for readability
+    dashboard = {
+        "overview": {
+            "total_requests": summary["total_requests"],
+            "active_streams": summary["active_streams"],
+            "total_tokens_processed": summary["total_tokens_processed"],
+        },
+        "requests_by_endpoint": summary["endpoint_requests"],
+        "errors_by_endpoint": summary["endpoint_errors"],
+        "latency": {
+            "overall": summary["latency_stats"],
+            "by_endpoint": summary["endpoint_latency_avg"]
+        }
+    }
+    return dashboard
 
 
 # implementing a background task that will run every 10 minutes
