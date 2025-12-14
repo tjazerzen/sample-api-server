@@ -1,11 +1,16 @@
 import asyncio
+from datetime import timedelta
 import os
+import time
+from typing import Annotated
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Depends, Request, status
 from fastapi.responses import StreamingResponse
 from openai import OpenAI
 from dotenv import load_dotenv
 from pydantic import BaseModel
+import jwt
+from fastapi.security import OAuth2PasswordBearer
 
 load_dotenv()
 
@@ -14,24 +19,64 @@ client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
 )
 
+TEST_USERNAME = "test"
+TEST_PASSWORD = "test"
+JWT_SECRET = os.getenv("JWT_SECRET")
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
 class CompletionRequest(BaseModel):
     prompt: str
 
-async def fake_video_streamer():
-    for _ in range(10):
-        yield b"some fake video bytes\n"
-        await asyncio.sleep(1)
+class LoginRequest(BaseModel):
+    email: str
+    password: str
 
 @app.get("/check-health")
 def check_health():
     return {"message": "Hello, World!"}
 
-@app.get("/stream")
-async def stream_video():
-    return StreamingResponse(fake_video_streamer())
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    print("-------------------------------- process_time", process_time)
+    response.headers["X-Process-Time"] = str(process_time)
+    return response
 
 
-async def stream_generator(prompt: str):
+# login to support bearer authentication
+@app.post("/login")
+async def login(request: LoginRequest):
+    if request.email != TEST_USERNAME or request.password != TEST_PASSWORD:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    # now return a jwt bearer token
+    # encode the jwt token
+    token = jwt.encode(
+        {
+            "email": request.email,
+        },
+        JWT_SECRET,
+        algorithm="HS256",
+    )
+    return {"token": token}
+
+async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]):
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+async def stream_generator(prompt: str, request: Request):
     stream = client.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
@@ -39,8 +84,12 @@ async def stream_generator(prompt: str):
     )
     for event in stream:
         if event.choices[0].delta.content:
-            yield f"data: {event.choices[0].delta.content}\n\n"
+            yield event.choices[0].delta.content
 
-@app.post("/complete")
-async def complete(request: CompletionRequest):
-    return StreamingResponse(stream_generator(request.prompt), media_type="text/event-stream")
+@app.post("/completion")
+async def completion(
+    request_body: CompletionRequest,
+    request: Request,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    return StreamingResponse(stream_generator(request_body.prompt, request), media_type="text/event-stream")
