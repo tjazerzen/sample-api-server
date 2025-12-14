@@ -1,11 +1,12 @@
 import asyncio
 from datetime import datetime, timedelta
+import io
 import logging
 import os
 import time
-from typing import Annotated
+from typing import BinaryIO, Annotated
 
-from fastapi import FastAPI, HTTPException, Depends, Request, status
+from fastapi import FastAPI, HTTPException, Depends, Request, status, File, UploadFile
 from fastapi.responses import StreamingResponse
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
@@ -124,6 +125,7 @@ metrics = MetricsStore()
 class CompletionRequest(BaseModel):
     prompt: str
 
+    
 class LoginRequest(BaseModel):
     email: str
     password: str
@@ -250,7 +252,7 @@ async def check_connection_limit(current_user: Annotated[dict, Depends(get_curre
     
     return current_user
 
-async def stream_generator(prompt: str, request: Request, user_email: str):
+async def stream_text_completion_generator(prompt: str, request: Request, user_email: str):
     total_chars = 0  # Simple approximation: 1 token ≈ 4 chars
     try:
         stream = await client.chat.completions.create(
@@ -264,7 +266,7 @@ async def stream_generator(prompt: str, request: Request, user_email: str):
             if event.choices[0].delta.content:
                 content = event.choices[0].delta.content
                 total_chars += len(content)
-                yield content
+                yield f"data: {content}\n\n"
     finally:
         # Approximate token count (rough: 4 chars per token)
         estimated_tokens = total_chars // 4
@@ -279,7 +281,36 @@ async def completion(
 ):
     user_email = current_user["email"]
     return StreamingResponse(
-        stream_generator(request_body.prompt, request, user_email), 
+        stream_text_completion_generator(request_body.prompt, request, user_email), 
+        media_type="text/event-stream"
+    )
+
+async def stream_text_to_speech_generator(audio_file: BinaryIO):
+    final_text = ""
+    stream = await client.audio.transcriptions.create(
+        model="gpt-4o-mini-transcribe",
+        file=audio_file,
+        response_format="text",
+        stream=True,
+    )
+
+    async for event in stream:
+        if event.type == "transcript.text.delta":
+            final_text += event.delta
+            # yield f"data: {event.delta}\n\n"
+            yield f"data: {str(event)}\n\n"
+            await asyncio.sleep(0.1)
+
+@app.post("/completion-stt")
+async def completion_stt(
+    audio_file: UploadFile = File(...),
+    request: Request = None,
+    current_user: Annotated[dict, Depends(check_connection_limit)] = None,
+):
+    user_email = current_user["email"]
+    audio_file = open(audio_file.filename, "rb")
+    return StreamingResponse(
+        stream_text_to_speech_generator(audio_file),
         media_type="text/event-stream"
     )
 
