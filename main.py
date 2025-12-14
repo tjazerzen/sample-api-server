@@ -119,9 +119,12 @@ async def startup_event():
 
 async def background_task():
     while True:
+        users_to_delete = []
         current_time = time.time()
         for user_email, timestamps in rate_limit_store.items():
             rate_limit_store[user_email] = [timestamp for timestamp in timestamps if current_time - timestamp < RATE_LIMIT_WINDOW]
             if len(rate_limit_store[user_email]) == 0:
-                del rate_limit_store[user_email]
+                users_to_delete.append(user_email)
+        for user_email in users_to_delete:
+            del rate_limit_store[user_email]
         await asyncio.sleep(10 * 60)
