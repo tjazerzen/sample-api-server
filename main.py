@@ -23,6 +23,11 @@ TEST_USERNAME = "test"
 TEST_PASSWORD = "test"
 JWT_SECRET = os.getenv("JWT_SECRET")
 
+# rate limit store is mapping from user email to list of timestamps of requests
+rate_limit_store: dict[str, list[float]] = {}
+RATE_LIMIT_WINDOW = 60 # 1 minute
+RATE_LIMIT_MAX_REQUESTS = 3
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 class CompletionRequest(BaseModel):
@@ -86,10 +91,37 @@ async def stream_generator(prompt: str, request: Request):
         if event.choices[0].delta.content:
             yield event.choices[0].delta.content
 
+async def check_rate_limit(current_user: Annotated[dict, Depends(get_current_user)]):
+    user_email = current_user["email"]
+    current_time = time.time()
+    if user_email not in rate_limit_store:
+        rate_limit_store[user_email] = []
+    print("-------------------------------- current rate_limit_store", rate_limit_store)
+    rate_limit_store[user_email] = [timestamp for timestamp in rate_limit_store[user_email] if current_time - timestamp < RATE_LIMIT_WINDOW]
+    if len(rate_limit_store[user_email]) >= RATE_LIMIT_MAX_REQUESTS:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded. Maximum 3 requests per minute.")
+    rate_limit_store[user_email].append(current_time)
+    return current_user
+            
 @app.post("/completion")
 async def completion(
     request_body: CompletionRequest,
     request: Request,
-    current_user: Annotated[dict, Depends(get_current_user)],
+    _current_user: Annotated[dict, Depends(check_rate_limit)],
 ):
     return StreamingResponse(stream_generator(request_body.prompt, request), media_type="text/event-stream")
+
+
+# implementing a background task that will run every 10 minutes
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(background_task())
+
+async def background_task():
+    while True:
+        current_time = time.time()
+        for user_email, timestamps in rate_limit_store.items():
+            rate_limit_store[user_email] = [timestamp for timestamp in timestamps if current_time - timestamp < RATE_LIMIT_WINDOW]
+            if len(rate_limit_store[user_email]) == 0:
+                del rate_limit_store[user_email]
+        await asyncio.sleep(10 * 60)
