@@ -7,7 +7,7 @@ import uuid
 
 from fastapi import FastAPI, HTTPException, Depends, Request, status
 from fastapi.responses import StreamingResponse
-from openai import OpenAI
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from pydantic import BaseModel
 import jwt
@@ -16,7 +16,7 @@ from fastapi.security import OAuth2PasswordBearer
 load_dotenv()
 
 app = FastAPI()
-client = OpenAI(
+client = AsyncOpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
 )
 
@@ -30,8 +30,8 @@ rate_limit_store: dict[str, list[float]] = {}
 connections_store: dict[str, int] = {}
 RATE_LIMIT_WINDOW = 60 # 1 minute
 RATE_LIMIT_MAX_REQUESTS = 3
-MAX_CONNECTIONS_PER_USER = 1
-MAX_GLOBAL_CONNECTIONS = 2
+MAX_CONNECTIONS_PER_USER = 2
+MAX_GLOBAL_CONNECTIONS = 4
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
@@ -86,19 +86,6 @@ async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]):
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-async def stream_generator(prompt: str, request: Request, user_email: str):
-    try:
-        stream = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            stream=True,
-        )
-        for event in stream:
-            if event.choices[0].delta.content:
-                yield event.choices[0].delta.content
-    finally:
-        await decrement_connection(user_email)
-
 async def check_rate_limit(current_user: Annotated[dict, Depends(get_current_user)]):
     user_email = current_user["email"]
     current_time = time.time()
@@ -129,6 +116,21 @@ async def check_connection_limit(current_user: Annotated[dict, Depends(get_curre
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=f"Connection limit exceeded. Maximum {MAX_CONNECTIONS_PER_USER} connections per user.")
     return current_user
             
+async def stream_generator(prompt: str, request: Request, user_email: str):
+    try:
+        stream = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            stream=True,
+        )
+        async for event in stream:
+            if await request.is_disconnected():
+                break
+            if event.choices[0].delta.content:
+                yield event.choices[0].delta.content
+    finally:
+        await decrement_connection(user_email)
+
 @app.post("/completion")
 async def completion(
     request_body: CompletionRequest,
