@@ -4,7 +4,6 @@ import logging
 import os
 import time
 from typing import Annotated
-import uuid
 
 from fastapi import FastAPI, HTTPException, Depends, Request, status
 from fastapi.responses import StreamingResponse
@@ -38,7 +37,6 @@ connections_lock = asyncio.Lock()
 RATE_LIMIT_WINDOW = 60 # 1 minute
 RATE_LIMIT_MAX_REQUESTS = 3
 MAX_CONNECTIONS_PER_USER = 2
-MAX_GLOBAL_CONNECTIONS = 4
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
