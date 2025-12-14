@@ -1,2 +1,3 @@
-# sample-api-server
+# Sample API Server
+
 Sample API server (fastapi)
